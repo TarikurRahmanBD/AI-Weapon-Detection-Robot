@@ -7,7 +7,7 @@ An advanced, real-time security and surveillance robot system integrating state-
 ## 👤 Developer & Creator
 *   **Lead Developer & Inventor:** **Tarikur Rahman**
 *   **GitHub:** [@tarikurrahmanbd](https://github.com/tarikurrahmanbd)
-*   **Portfolio:** [yourtarikur.netlify.app](https://yourtarikur.netlify.app)
+*   **Portfolio:** [yourtarikur.vercel.app](https://yourtarikur.vercel.app)
 
 ---
 
