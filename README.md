@@ -20,6 +20,7 @@
 
 - [Project Overview](#project-overview)
 - [How It Works](#how-it-works)
+- [Processing Pipeline](#processing-pipeline)
 - [Features](#features)
 - [Requirements](#requirements)
 - [Installation](#installation)
@@ -28,13 +29,18 @@
 - [Detection and Model Selection](#detection-and-model-selection)
 - [Arduino Robot Controls](#arduino-robot-controls)
 - [HTTP Routes](#http-routes)
+- [API Examples and Response Data](#api-examples-and-response-data)
 - [Snapshots, Events, and GPS](#snapshots-events-and-gps)
+- [Event Data and Export Format](#event-data-and-export-format)
 - [Configuration](#configuration)
+- [Performance Tuning Notes](#performance-tuning-notes)
+- [Validation Checklist](#validation-checklist)
 - [Security, Privacy, and Responsible Use](#security-privacy-and-responsible-use)
 - [Troubleshooting](#troubleshooting)
 - [Frequently Asked Questions](#frequently-asked-questions)
 - [Repository Structure](#repository-structure)
 - [Contributing](#contributing)
+- [Learning Resources](#learning-resources)
 - [About the Developer](#about-the-developer)
 - [License](#license)
 
@@ -75,6 +81,138 @@ Browser location -------------------------------> event location markers
 The camera/inference loop is shared by browser viewers rather than running a separate model pass for every connected client. Camera capture is lazy: it starts when a dashboard or video-feed viewer connects and is released after the configured viewer-idle interval.
 
 Detection alerts and movement controls are separate. A detection can create an event and snapshot, but it does not send a drive or arm command to the Arduino.
+
+## Processing Pipeline
+
+This section describes the current implementation in `app.py`; it is not a promise about future releases.
+
+### Startup sequence
+
+1. The application resolves its base directory from the location of `app.py`.
+2. It creates the `snapshots/` folder if that folder does not exist.
+3. It selects the ONNX model when the ONNX file exists; otherwise, it selects the PyTorch file.
+4. It loads the selected model, reads the model class names, and performs a warm-up prediction.
+5. It attempts to open the Arduino serial port. Failure to connect is non-fatal.
+6. It starts one background inference thread. The thread waits for a viewer before opening a camera.
+
+If model initialization fails, the web application cannot complete startup. Serial connection failure, by contrast, leaves the detection portion available.
+
+### Camera and frame processing
+
+The inference thread searches for USB cameras exposed through Linux V4L2. If no suitable USB camera is found, it tries Raspberry Pi Camera Module support through Picamera2. It requests a capture size of `480 x 360` and targets 30 FPS when configuring a USB camera; actual camera output can differ.
+
+For each captured frame, the application:
+
+1. Runs model inference on every fourth frame by default.
+2. Reuses the last detected weapon and person boxes on the frames between inference runs.
+3. Checks whether person boxes overlap weapon boxes to derive person-related labels.
+4. Draws labels and boxes on a copy of the captured frame.
+5. Updates shared dashboard state and creates an event when the alert changes from inactive to active.
+6. Applies the chosen display color mode, encodes a JPEG, and stores it in a shared frame buffer.
+
+The Flask `/video_feed` route reads the shared JPEG buffer and sends it as an MJPEG stream. It does not run another inference for each browser viewer. The loop releases the camera after a period with no active viewers and tries to open it again when a viewer returns.
+
+### Person and weapon label derivation
+
+The configured weapon class names include `gun`, `guns`, `pistol`, `rifle`, `knife`, `Knife`, and `weapon`. The actual model output must use compatible names for those labels to be recognized as weapons.
+
+The application separately reads boxes named `person`. It then derives labels from overlap with weapon boxes:
+
+| Derived label | Current rule in the application |
+| --- | --- |
+| `person` | A detected person box does not overlap a recognized weapon box |
+| `armed person` | A detected person overlaps a recognized weapon other than the configured military subset |
+| `military personnel` | A detected person overlaps a weapon named `rifle`, `gun`, or `guns` |
+| Weapon class label | The weapon itself is also included as a separate detection |
+
+These are code-defined labels, not a validated assessment of a person's identity, intent, affiliation, or threat. Box overlap can associate objects incorrectly, particularly in crowded or low-resolution frames. Treat these labels as experimental model output only.
+
+## API Examples and Response Data
+
+The examples below call the local Flask server. Replace `localhost` with the host address only when using a trusted network.
+
+### Read current detections
+
+```bash
+curl http://localhost:5000/detections
+```
+
+The response contains the current state and recent event queue. A representative response shape is:
+
+```json
+{
+	"alert": false,
+	"detections": [
+		{"class": "person", "confidence": 1.0},
+		{"class": "pistol", "confidence": 0.82}
+	],
+	"events": [],
+	"fps": 8,
+	"military": 0,
+	"persons": 1,
+	"total_weapons_seen": 0
+}
+```
+
+Values above are examples only. The actual classes, confidence values, counts, and FPS depend on the loaded model and live camera.
+
+### Change the detection threshold
+
+```bash
+curl "http://localhost:5000/set_conf?value=0.50"
+```
+
+The app clamps the supplied value to its accepted range of `0.05` through `0.95`. This changes the inference confidence threshold; it does not change model weights.
+
+### Change the displayed image mode
+
+```bash
+curl "http://localhost:5000/set_view?mode=gray"
+```
+
+Accepted modes are `normal`, `night`, `thermal`, and `gray`. The names `night` and `thermal` refer to image transforms, not specialized sensors.
+
+### Send a manual stop command
+
+```bash
+curl "http://localhost:5000/cmd?c=W"
+```
+
+The response indicates whether a serial write was sent. An HTTP success response does not mean the motors physically stopped; check the board, wiring, power, and serial status. The `/cmd` route is not protected by the dashboard UI unlock.
+
+### Submit a browser location
+
+```bash
+curl -X POST http://localhost:5000/location \
+	-H "Content-Type: application/json" \
+	-d '{"lat": 23.8103, "lon": 90.4125, "accuracy": 20}'
+```
+
+This route accepts numeric latitude and longitude, plus optional accuracy. A location submitted this way is application state on the server; do not send a person's location unless you have permission and a valid purpose.
+
+### Download the current event CSV
+
+```bash
+curl -o events.csv http://localhost:5000/events.csv
+```
+
+## Event Data and Export Format
+
+The event counter displayed in the dashboard is not a count of every detected object or every inference frame. It increments when the application enters an alert state after previously having no alert. While the alert remains active, repeated frames do not create a new event each time.
+
+The CSV endpoint writes two columns:
+
+```csv
+time,message
+10:25:31,pistol (82%)
+10:28:05,ARMED PERSON (1)
+```
+
+The sample rows are illustrative. The `message` can describe a recognized weapon class, an armed-person label, or a military-personnel label depending on current detections. Although GPS coordinates are attached to in-memory event objects when available, the CSV writer currently exports only `time` and `message`.
+
+The event queue is bounded to 200 recent entries in memory. The alert marker list is bounded separately. Neither list is a database, and both are cleared when the Python process restarts. JPEG snapshots are separate files on disk and are not removed when the in-memory queue rolls over.
+
+Snapshot filenames use the approximate form `alert_YYYYMMDD_HHMMSS.jpg`. The implementation limits snapshot writes to at most one per configured interval (currently five seconds), even if alert transitions happen more frequently.
 
 ## Features
 
@@ -357,6 +495,79 @@ Several values are currently configured directly in `app.py` and `arduino.cpp`, 
 | Control UI password | Hard-coded as `1234` in `app.py`; not secure authentication |
 
 Do not change serial baud rate on only one side: the host application and Arduino firmware must use the same value.
+
+## Performance Tuning Notes
+
+The following values are implementation constants near the top of `app.py`. They are not exposed as environment variables or a separate config file in the current version.
+
+| Constant | Current value | General effect when adjusted |
+| --- | --- | --- |
+| `_CAP_W`, `_CAP_H` | `480`, `360` | Larger capture frames can preserve more detail but require more capture, inference, and encoding work |
+| `_INFER_SIZE` | `192` | Larger model input can affect detail and latency; confirm compatibility and test the actual model before changing |
+| `_INFER_EVERY` | `4` | Lower values run inference more often and increase workload; higher values reuse older boxes for more frames |
+| `_JPEG_QUALITY` | `65` | Higher JPEG quality can improve stream appearance while increasing encoded data size |
+| `_VIEWER_IDLE_SECS` | `30` | Camera is released after this much time without an active viewer |
+
+These settings interact with the model, camera, CPU, memory, and number of clients. Change one value at a time and validate both detection behavior and stream stability. Increasing resolution or inference frequency does not guarantee improved real-world accuracy.
+
+### Understanding the displayed FPS
+
+The application computes FPS from captured/processed loop frames over time. It is not a measure of model accuracy, end-to-end browser latency, or the number of full model predictions per second. Since inference is skipped on some frames, the display FPS and inference cadence are different measurements.
+
+### CPU, ONNX, and PyTorch
+
+The application prefers the included ONNX file based on file presence. Runtime speed varies by processor, ONNX Runtime build, model, and installation. The `.pt` model uses the Ultralytics/PyTorch path. Compare both only under the same camera, input size, and operating conditions; do not assume one format is always faster on every device.
+
+## Validation Checklist
+
+Use this checklist after installation, model changes, firmware changes, or wiring changes. It is a manual smoke-test guide, not an automated test suite.
+
+### Detection-only check
+
+- Start the app with a supported camera connected and no Arduino attached.
+- Confirm the selected model and class names appear in the terminal startup output.
+- Open the dashboard and verify the live image appears.
+- Change confidence and display mode, then check that the video continues.
+- Disconnect the dashboard and verify the camera can be released after the idle interval.
+- Reopen the dashboard and confirm that capture can restart.
+
+### Event and file check
+
+- Confirm that alert events appear on an inactive-to-active transition, not on every frame.
+- Open `/gallery` and verify saved snapshots can be viewed.
+- Download `/events.csv` and check the header and exported event messages.
+- Restart the process and verify your understanding that event state is cleared while snapshots remain on disk.
+
+### Arduino check
+
+- Test with wheels raised and a physical power disconnect available.
+- Verify serial connection status before sending any movement command.
+- Test stop first, then one movement direction at a time at low speed.
+- Verify each motor direction against the actual chassis wiring.
+- Test arm positions and timed servo pulses without putting hands in moving linkages.
+- Stop sending movement commands and confirm the firmware watchdog stops the motors.
+
+Do not use a successful HTTP response or a dashboard status badge as proof that physical hardware is safe or functioning correctly.
+
+## Learning Resources
+
+The project combines several independent topics. These primary references are useful when adapting or debugging a component:
+
+- [Ultralytics documentation](https://docs.ultralytics.com/) for model loading, prediction, and supported export formats.
+- [OpenCV documentation](https://docs.opencv.org/) for image processing, camera capture, and JPEG encoding.
+- [Flask documentation](https://flask.palletsprojects.com/) for routes, requests, and responses.
+- [PySerial documentation](https://pyserial.readthedocs.io/) for serial port configuration and troubleshooting.
+- [Arduino Servo library reference](https://docs.arduino.cc/libraries/servo/) for servo attachment and control.
+- [Raspberry Pi Picamera2 documentation](https://www.raspberrypi.com/documentation/computers/camera_software.html) for Raspberry Pi camera setup.
+
+Useful concepts to explore while reading the source:
+
+1. Object detection outputs: class IDs, confidence values, and bounding boxes.
+2. Intersection and overlap between bounding boxes, and why spatial overlap is not proof of intent or ownership.
+3. Producer/consumer design: one background frame producer shared by multiple HTTP clients.
+4. MJPEG streaming over an HTTP multipart response.
+5. Serial protocols, command validation, motor drivers, PWM, and watchdog behavior.
+6. The difference between a display transform and information captured by a physical sensor.
 
 ## Security, Privacy, and Responsible Use
 
