@@ -476,7 +476,7 @@ Contributions that improve reliability, accessibility, documentation, testing, o
 
 - GitHub: [@tarikurrahmanbd](https://github.com/tarikurrahmanbd)
 - Portfolio: [yourtarikur.vercel.app](https://yourtarikur.vercel.app/)
-- Email: [tarikurrahman08@gmail.com](mailto:tarikurrahman08@gmail.com)
+- Email: [tarikurrahman2008@gmail.com](mailto:tarikurrahman2008@gmail.com)
 
 ## License
 
