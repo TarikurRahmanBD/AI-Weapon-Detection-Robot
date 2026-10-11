@@ -600,11 +600,3 @@ Camera
 এটাই এই project-এর মূল idea.
 
 ---
-
-যদি চাই, আমি পরের ধাপে এই একই ডকুমেন্টিটাকে আরো সুন্দর করে:
-1. GitHub README style
-2. classroom presentation format
-3. diagram-heavy version
-4. very short summary for viva/exam
-
-এই চারটি format-এও সাজিয়ে দিতে পারি।
